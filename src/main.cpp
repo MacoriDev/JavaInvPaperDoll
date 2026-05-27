@@ -111,6 +111,22 @@ float BitsFloat(std::uint32_t bits) {
     return value;
 }
 
+// The original mouse branch at RVA 0x097B8BB8 / 0x097B8C9C reads this
+// render/UI scale and applies it to the signed-short mouse coordinates.
+float ReadNativePointerScale(void* lookContext) {
+    if (!lookContext) {
+        return 0.0f;
+    }
+    void* scaleState = nullptr;
+    std::memcpy(&scaleState, reinterpret_cast<std::byte*>(lookContext) + 0x10, sizeof(scaleState));
+    if (!scaleState) {
+        return 0.0f;
+    }
+    float scale = 0.0f;
+    std::memcpy(&scale, reinterpret_cast<std::byte*>(scaleState) + 0x60, sizeof(scale));
+    return scale;
+}
+
 template <typename T>
 T Symbol(void* library, const char* name) {
     return reinterpret_cast<T>(dlsym(library, name));
@@ -216,21 +232,31 @@ void HookLivePlayerLookOffset(
 
     const float touchX = BitsFloat(g_touchXBits.load(std::memory_order_relaxed));
     const float touchY = BitsFloat(g_touchYBits.load(std::memory_order_relaxed));
+    const float nativeScale = ReadNativePointerScale(arg2);
+    if (!(nativeScale > 0.0f) || !(nativeScale < 16.0f)) {
+        return;
+    }
 
-    // Derived from the original helper's cursor path:
-    // outputX = modelCenterX - pointerX; outputY = modelCenterY - pointerY.
+    // Native mouse path, recovered from the supplied ARM64 binary:
+    //   outX = signedShortMouseX * nativeScale - modelCenterX
+    //   outY = modelCenterY - signedShortMouseY * nativeScale
+    // v5 incorrectly used raw Android pixels directly and reversed X, causing
+    // huge saturated values such as (-1933, -647) and unnatural movement.
+    const float nativeTouchX = static_cast<float>(static_cast<std::int16_t>(touchX));
+    const float nativeTouchY = static_cast<float>(static_cast<std::int16_t>(touchY));
     const float originalX = *outX;
     const float originalY = *outY;
-    *outX = modelCenterX - touchX;
-    *outY = modelCenterY - touchY;
+    *outX = nativeTouchX * nativeScale - modelCenterX;
+    *outY = modelCenterY - nativeTouchY * nativeScale;
 
     const std::uint64_t frame = g_overrideFrames.fetch_add(1, std::memory_order_relaxed) + 1;
     const std::int64_t now = NowNs();
     std::int64_t previous = g_lastRenderLogNs.load(std::memory_order_relaxed);
     if (now - previous >= kRenderLogIntervalNs &&
         g_lastRenderLogNs.compare_exchange_strong(previous, now, std::memory_order_relaxed)) {
-        LOGI("RENDER LOOK #%" PRIu64 " center=(%.1f,%.1f) touch=(%.1f,%.1f) original=(%.1f,%.1f) override=(%.1f,%.1f)",
+        LOGI("NATIVE LOOK #%" PRIu64 " scale=%.5f center=(%.1f,%.1f) touchRaw=(%.1f,%.1f) original=(%.1f,%.1f) override=(%.1f,%.1f)",
              frame,
+             static_cast<double>(nativeScale),
              static_cast<double>(modelCenterX), static_cast<double>(modelCenterY),
              static_cast<double>(touchX), static_cast<double>(touchY),
              static_cast<double>(originalX), static_cast<double>(originalY),
@@ -312,8 +338,8 @@ bool InstallHooks() {
         return false;
     }
 
-    LOGI("installed v5 renderer-side look override; motionTarget=%p lookTarget=%p", motionTarget, lookTarget);
-    LOGI("input-mode safe design: GameActivity touch events are observed only, never rewritten as mouse");
+    LOGI("installed v5.1 native-scale renderer-side look override; motionTarget=%p lookTarget=%p", motionTarget, lookTarget);
+    LOGI("input-mode safe design: TOUCH events preserved; renderer now applies original mouse coordinate scale/sign formula");
     LOGI("inventory follow start bounds raw=(%.0f,%.0f)-(%.0f,%.0f)",
          static_cast<double>(kInventoryLeft), static_cast<double>(kInventoryTop),
          static_cast<double>(kInventoryRight), static_cast<double>(kInventoryBottom));
@@ -322,7 +348,7 @@ bool InstallHooks() {
 }
 
 void* InitThread(void*) {
-    LOGI("module loaded: JsonUI inventory touch follow v5 (renderer-side; touch preserved)");
+    LOGI("module loaded: JsonUI inventory touch follow v5.1 (native mouse math; touch preserved)");
     if (ResolvePreloaderApi()) {
         InstallHooks();
     }
