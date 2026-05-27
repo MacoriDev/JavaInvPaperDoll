@@ -223,22 +223,23 @@ void HookLivePlayerLookOffset(
         return;
     }
 
-    // v5.1 matched the native coordinate scale, but touch drove both model axes in
-    // the opposite direction on-device. Keep the native scaling and invert both
-    // look offsets around the same center.
+    // Device test result:
+    // - Horizontal direction needed inversion relative to v5.1.
+    // - Vertical direction in v5.1 was already correct.
+    // Keep native scaling, invert X only, and restore Y to its v5.1 direction.
     const float nativeTouchX = static_cast<float>(static_cast<std::int16_t>(touchX));
     const float nativeTouchY = static_cast<float>(static_cast<std::int16_t>(touchY));
     const float originalX = *outX;
     const float originalY = *outY;
     *outX = modelCenterX - nativeTouchX * nativeScale;
-    *outY = nativeTouchY * nativeScale - modelCenterY;
+    *outY = modelCenterY - nativeTouchY * nativeScale;
 
     const std::uint64_t frame = g_overrideFrames.fetch_add(1, std::memory_order_relaxed) + 1;
     const std::int64_t now = NowNs();
     std::int64_t previous = g_lastRenderLogNs.load(std::memory_order_relaxed);
     if (now - previous >= kRenderLogIntervalNs &&
         g_lastRenderLogNs.compare_exchange_strong(previous, now, std::memory_order_relaxed)) {
-        LOGI("NATIVE LOOK INVERTED #%" PRIu64 " scale=%.5f center=(%.1f,%.1f) touchRaw=(%.1f,%.1f) original=(%.1f,%.1f) override=(%.1f,%.1f)",
+        LOGI("NATIVE LOOK X-INVERTED #%" PRIu64 " scale=%.5f center=(%.1f,%.1f) touchRaw=(%.1f,%.1f) original=(%.1f,%.1f) override=(%.1f,%.1f)",
              frame,
              static_cast<double>(nativeScale),
              static_cast<double>(modelCenterX), static_cast<double>(modelCenterY),
@@ -322,16 +323,16 @@ bool InstallHooks() {
         return false;
     }
 
-    LOGI("installed v5.2 full-screen held-look renderer override; motionTarget=%p lookTarget=%p", motionTarget, lookTarget);
+    LOGI("installed v5.3 full-screen held-look renderer override; motionTarget=%p lookTarget=%p", motionTarget, lookTarget);
     LOGI("input-mode safe design: TOUCH events preserved; no synthetic mouse input is emitted");
     LOGI("touch follow area: entire screen; gaze hold: persistent after finger release");
-    LOGI("axis correction: v5.1 scaled result inverted on X and Y");
+    LOGI("axis correction: X inverted; Y restored to v5.1 direction");
     LOGI("test WITHOUT a connected mouse: inventory -> tap/drag anywhere on the screen");
     return true;
 }
 
 void* InitThread(void*) {
-    LOGI("module loaded: JsonUI inventory touch follow v5.2 (full-screen held-look; touch preserved)");
+    LOGI("module loaded: JsonUI inventory touch follow v5.3 (X-only inversion; full-screen held-look)");
     if (ResolvePreloaderApi()) {
         InstallHooks();
     }
