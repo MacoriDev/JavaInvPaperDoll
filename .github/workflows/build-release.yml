@@ -74,7 +74,7 @@ jobs:
           set -euo pipefail
           TAG="continuous-${GITHUB_REF_NAME}"
           TITLE="${MODULE_NAME} continuous (${GITHUB_REF_NAME})"
-          NOTES="Automatic ARM64 test build from commit ${GITHUB_SHA}. This is a JsonUI inventory preview probe build; it logs LivePlayerRenderer/PaperDollRenderer calls and touch coordinates."
+          NOTES="Automatic ARM64 test build from commit ${GITHUB_SHA}. This is a JsonUI GameActivity input probe build; it logs mouse and touch motion events without changing Minecraft rendering or input."
 
           git tag --force "$TAG" "$GITHUB_SHA"
           git push origin "refs/tags/${TAG}" --force
