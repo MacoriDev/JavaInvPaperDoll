@@ -1,4 +1,3 @@
-#include <android/input.h>
 #include <android/log.h>
 #include <dlfcn.h>
 #include <pthread.h>
@@ -7,13 +6,58 @@
 #include <atomic>
 #include <chrono>
 #include <cinttypes>
+#include <cstddef>
 #include <cstdint>
+#include <cstring>
 
 namespace {
 
 constexpr const char* kLogTag = "InventoryTouchFollow";
 constexpr const char* kPreloaderLibrary = "libpreloader.so";
-constexpr std::int64_t kMotionLogIntervalNs = 120'000'000LL;
+constexpr const char* kMinecraftLibrary = "libminecraftpe.so";
+constexpr std::int64_t kMotionLogIntervalNs = 90'000'000LL;
+
+// Confirmed from the supplied libminecraftpe.so disassembly:
+// GameActivityMotionEvent size used by android_app_clear_motion_events.
+constexpr std::size_t kMotionEventSize = 0x6E0;
+constexpr std::size_t kEventDeviceIdOffset = 0x00;
+constexpr std::size_t kEventSourceOffset = 0x04;
+constexpr std::size_t kEventActionOffset = 0x08;
+constexpr std::size_t kEventPointerCountOffset = 0x38;
+constexpr std::size_t kFirstPointerOffset = 0x3C;
+constexpr std::size_t kPointerStride = 0xD0;
+constexpr std::size_t kPointerIdOffset = 0x00;
+constexpr std::size_t kPointerToolTypeOffset = 0x04;
+constexpr std::size_t kPointerAxisXOffset = 0x08; // AMOTION_EVENT_AXIS_X = 0
+constexpr std::size_t kPointerAxisYOffset = 0x0C; // AMOTION_EVENT_AXIS_Y = 1
+
+constexpr std::int32_t kActionMask = 0xFF;
+constexpr std::int32_t kActionPointerIndexMask = 0xFF00;
+constexpr std::int32_t kActionPointerIndexShift = 8;
+
+enum : std::int32_t {
+    ACTION_DOWN = 0,
+    ACTION_UP = 1,
+    ACTION_MOVE = 2,
+    ACTION_CANCEL = 3,
+    ACTION_OUTSIDE = 4,
+    ACTION_POINTER_DOWN = 5,
+    ACTION_POINTER_UP = 6,
+    ACTION_HOVER_MOVE = 7,
+    ACTION_SCROLL = 8,
+    ACTION_HOVER_ENTER = 9,
+    ACTION_HOVER_EXIT = 10,
+    ACTION_BUTTON_PRESS = 11,
+    ACTION_BUTTON_RELEASE = 12,
+};
+
+enum : std::int32_t {
+    TOOL_UNKNOWN = 0,
+    TOOL_FINGER = 1,
+    TOOL_STYLUS = 2,
+    TOOL_MOUSE = 3,
+    TOOL_ERASER = 4,
+};
 
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, kLogTag, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, kLogTag, __VA_ARGS__)
@@ -22,15 +66,25 @@ constexpr std::int64_t kMotionLogIntervalNs = 120'000'000LL;
 using GHook = void*;
 using GlossInitFn = void (*)(bool);
 using GlossHookFn = GHook (*)(void*, void*, void**);
-using AInputQueueGetEventFn = int32_t (*)(AInputQueue*, AInputEvent**);
+
+// Mirrors the beginning of android_input_buffer from GameActivity native_app_glue.
+// We only need the first two fields to read motion events before Minecraft processes them.
+struct AndroidInputBufferPrefix {
+    std::byte* motionEvents;
+    std::uint64_t motionEventsCount;
+    std::uint64_t motionEventsBufferSize;
+};
+
+using SwapInputBuffersFn = AndroidInputBufferPrefix* (*)(void* androidApp);
 
 GlossInitFn g_glossInit = nullptr;
 GlossHookFn g_glossHook = nullptr;
-AInputQueueGetEventFn g_oldGetEvent = nullptr;
-GHook g_inputHook = nullptr;
+SwapInputBuffersFn g_oldSwapInputBuffers = nullptr;
+GHook g_swapHook = nullptr;
 
 std::atomic<std::int64_t> g_lastMotionLogNs{0};
 std::atomic<std::uint64_t> g_motionCount{0};
+std::atomic<bool> g_loggedFirstBuffer{false};
 
 std::int64_t NowNs() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -38,42 +92,48 @@ std::int64_t NowNs() {
 }
 
 template <typename T>
+T ReadValue(const std::byte* base, std::size_t offset) {
+    T value{};
+    std::memcpy(&value, base + offset, sizeof(T));
+    return value;
+}
+
+template <typename T>
 T Symbol(void* library, const char* name) {
     return reinterpret_cast<T>(dlsym(library, name));
 }
 
-const char* ActionName(int32_t action) {
+const char* ActionName(std::int32_t action) {
     switch (action) {
-        case AMOTION_EVENT_ACTION_DOWN: return "DOWN";
-        case AMOTION_EVENT_ACTION_UP: return "UP";
-        case AMOTION_EVENT_ACTION_MOVE: return "MOVE";
-        case AMOTION_EVENT_ACTION_CANCEL: return "CANCEL";
-        case AMOTION_EVENT_ACTION_OUTSIDE: return "OUTSIDE";
-        case AMOTION_EVENT_ACTION_POINTER_DOWN: return "POINTER_DOWN";
-        case AMOTION_EVENT_ACTION_POINTER_UP: return "POINTER_UP";
-        case AMOTION_EVENT_ACTION_HOVER_MOVE: return "HOVER_MOVE";
-        case AMOTION_EVENT_ACTION_SCROLL: return "SCROLL";
-        case AMOTION_EVENT_ACTION_HOVER_ENTER: return "HOVER_ENTER";
-        case AMOTION_EVENT_ACTION_HOVER_EXIT: return "HOVER_EXIT";
-        case AMOTION_EVENT_ACTION_BUTTON_PRESS: return "BUTTON_PRESS";
-        case AMOTION_EVENT_ACTION_BUTTON_RELEASE: return "BUTTON_RELEASE";
+        case ACTION_DOWN: return "DOWN";
+        case ACTION_UP: return "UP";
+        case ACTION_MOVE: return "MOVE";
+        case ACTION_CANCEL: return "CANCEL";
+        case ACTION_OUTSIDE: return "OUTSIDE";
+        case ACTION_POINTER_DOWN: return "POINTER_DOWN";
+        case ACTION_POINTER_UP: return "POINTER_UP";
+        case ACTION_HOVER_MOVE: return "HOVER_MOVE";
+        case ACTION_SCROLL: return "SCROLL";
+        case ACTION_HOVER_ENTER: return "HOVER_ENTER";
+        case ACTION_HOVER_EXIT: return "HOVER_EXIT";
+        case ACTION_BUTTON_PRESS: return "BUTTON_PRESS";
+        case ACTION_BUTTON_RELEASE: return "BUTTON_RELEASE";
         default: return "OTHER";
     }
 }
 
-const char* ToolName(int32_t tool) {
+const char* ToolName(std::int32_t tool) {
     switch (tool) {
-        case AMOTION_EVENT_TOOL_TYPE_FINGER: return "FINGER";
-        case AMOTION_EVENT_TOOL_TYPE_STYLUS: return "STYLUS";
-        case AMOTION_EVENT_TOOL_TYPE_MOUSE: return "MOUSE";
-        case AMOTION_EVENT_TOOL_TYPE_ERASER: return "ERASER";
+        case TOOL_FINGER: return "FINGER";
+        case TOOL_STYLUS: return "STYLUS";
+        case TOOL_MOUSE: return "MOUSE";
+        case TOOL_ERASER: return "ERASER";
         default: return "UNKNOWN";
     }
 }
 
-bool ShouldLogMotion(int32_t maskedAction) {
-    const bool frequent = maskedAction == AMOTION_EVENT_ACTION_MOVE ||
-                          maskedAction == AMOTION_EVENT_ACTION_HOVER_MOVE;
+bool ShouldLogMotion(std::int32_t maskedAction) {
+    const bool frequent = maskedAction == ACTION_MOVE || maskedAction == ACTION_HOVER_MOVE;
     if (!frequent) {
         return true;
     }
@@ -83,55 +143,61 @@ bool ShouldLogMotion(int32_t maskedAction) {
     if (now - previous < kMotionLogIntervalNs) {
         return false;
     }
-    return g_lastMotionLogNs.compare_exchange_strong(
-        previous, now, std::memory_order_relaxed);
+    return g_lastMotionLogNs.compare_exchange_strong(previous, now, std::memory_order_relaxed);
 }
 
-void RecordMotion(AInputEvent* event) {
-    const int32_t action = AMotionEvent_getAction(event);
-    const int32_t maskedAction = action & AMOTION_EVENT_ACTION_MASK;
+void RecordMotion(const std::byte* event) {
+    const std::int32_t action = ReadValue<std::int32_t>(event, kEventActionOffset);
+    const std::int32_t maskedAction = action & kActionMask;
     if (!ShouldLogMotion(maskedAction)) {
         return;
     }
 
-    const std::size_t pointerCount = AMotionEvent_getPointerCount(event);
-    if (pointerCount == 0) {
+    std::int32_t pointerCount = ReadValue<std::int32_t>(event, kEventPointerCountOffset);
+    if (pointerCount < 1 || pointerCount > 8) {
+        LOGW("invalid GameActivity pointerCount=%d action=0x%x", pointerCount, action);
         return;
     }
 
-    std::size_t pointerIndex = static_cast<std::size_t>(
-        (action & AMOTION_EVENT_ACTION_POINTER_INDEX_MASK) >>
-        AMOTION_EVENT_ACTION_POINTER_INDEX_SHIFT);
-    if (pointerIndex >= pointerCount) {
+    std::int32_t pointerIndex = (action & kActionPointerIndexMask) >> kActionPointerIndexShift;
+    if (pointerIndex < 0 || pointerIndex >= pointerCount) {
         pointerIndex = 0;
     }
 
-    const float x = AMotionEvent_getX(event, pointerIndex);
-    const float y = AMotionEvent_getY(event, pointerIndex);
-    const int32_t source = AInputEvent_getSource(event);
-    const int32_t tool = AMotionEvent_getToolType(event, pointerIndex);
-    const int32_t buttons = AMotionEvent_getButtonState(event);
-    const int32_t deviceId = AInputEvent_getDeviceId(event);
+    const std::size_t pointer = kFirstPointerOffset + static_cast<std::size_t>(pointerIndex) * kPointerStride;
+    const std::int32_t deviceId = ReadValue<std::int32_t>(event, kEventDeviceIdOffset);
+    const std::int32_t source = ReadValue<std::int32_t>(event, kEventSourceOffset);
+    const std::int32_t pointerId = ReadValue<std::int32_t>(event, pointer + kPointerIdOffset);
+    const std::int32_t tool = ReadValue<std::int32_t>(event, pointer + kPointerToolTypeOffset);
+    const float x = ReadValue<float>(event, pointer + kPointerAxisXOffset);
+    const float y = ReadValue<float>(event, pointer + kPointerAxisYOffset);
     const std::uint64_t count = g_motionCount.fetch_add(1, std::memory_order_relaxed) + 1;
 
-    LOGI("INPUT #%" PRIu64 " action=%s(%d) source=0x%08x tool=%s(%d) buttons=0x%x device=%d pointer=%zu/%zu pos=(%.1f,%.1f)",
+    LOGI("GA_INPUT #%" PRIu64 " action=%s(%d) source=0x%08x tool=%s(%d) device=%d pointerId=%d index=%d/%d pos=(%.1f,%.1f)",
          count,
          ActionName(maskedAction), maskedAction,
-         source,
+         static_cast<unsigned int>(source),
          ToolName(tool), tool,
-         buttons,
-         deviceId,
-         pointerIndex, pointerCount,
+         deviceId, pointerId, pointerIndex, pointerCount,
          static_cast<double>(x), static_cast<double>(y));
 }
 
-int32_t HookGetEvent(AInputQueue* queue, AInputEvent** outEvent) {
-    const int32_t result = g_oldGetEvent ? g_oldGetEvent(queue, outEvent) : -1;
-    if (result >= 0 && outEvent != nullptr && *outEvent != nullptr &&
-        AInputEvent_getType(*outEvent) == AINPUT_EVENT_TYPE_MOTION) {
-        RecordMotion(*outEvent);
+AndroidInputBufferPrefix* HookSwapInputBuffers(void* androidApp) {
+    AndroidInputBufferPrefix* buffer = g_oldSwapInputBuffers ? g_oldSwapInputBuffers(androidApp) : nullptr;
+    if (!buffer || !buffer->motionEvents || buffer->motionEventsCount == 0) {
+        return buffer;
     }
-    return result;
+
+    if (!g_loggedFirstBuffer.exchange(true, std::memory_order_relaxed)) {
+        LOGI("first GameActivity motion buffer received: count=%" PRIu64 " capacity=%" PRIu64,
+             buffer->motionEventsCount, buffer->motionEventsBufferSize);
+    }
+
+    const std::uint64_t count = buffer->motionEventsCount > 32 ? 32 : buffer->motionEventsCount;
+    for (std::uint64_t i = 0; i < count; ++i) {
+        RecordMotion(buffer->motionEvents + (static_cast<std::size_t>(i) * kMotionEventSize));
+    }
+    return buffer;
 }
 
 bool ResolvePreloaderApi() {
@@ -141,11 +207,11 @@ bool ResolvePreloaderApi() {
     void* preloader = nullptr;
     for (int attempt = 0; attempt < 120 && preloader == nullptr; ++attempt) {
         preloader = dlopen(kPreloaderLibrary, RTLD_NOW | RTLD_NOLOAD);
-        if (preloader == nullptr) {
+        if (!preloader) {
             usleep(250 * 1000);
         }
     }
-    if (preloader == nullptr) {
+    if (!preloader) {
         LOGE("%s was not already loaded", kPreloaderLibrary);
         return false;
     }
@@ -157,47 +223,45 @@ bool ResolvePreloaderApi() {
              reinterpret_cast<void*>(g_glossInit), reinterpret_cast<void*>(g_glossHook));
         return false;
     }
-
     g_glossInit(true);
     return true;
 }
 
-void InstallInputProbe() {
+bool InstallGameActivityInputProbe() {
 #ifndef RTLD_NOLOAD
 #define RTLD_NOLOAD 0x00004
 #endif
-    void* androidLibrary = dlopen("libandroid.so", RTLD_NOW | RTLD_NOLOAD);
-    if (!androidLibrary) {
-        androidLibrary = dlopen("libandroid.so", RTLD_NOW);
-    }
-    if (!androidLibrary) {
-        LOGE("could not open libandroid.so");
-        return;
+    void* minecraft = dlopen(kMinecraftLibrary, RTLD_NOW | RTLD_NOLOAD);
+    if (!minecraft) {
+        LOGE("%s not loaded", kMinecraftLibrary);
+        return false;
     }
 
-    void* inputTarget = dlsym(androidLibrary, "AInputQueue_getEvent");
-    if (!inputTarget) {
-        LOGE("AInputQueue_getEvent not found");
-        return;
+    void* target = dlsym(minecraft, "android_app_swap_input_buffers");
+    if (!target) {
+        LOGE("android_app_swap_input_buffers export not found");
+        return false;
     }
 
-    g_inputHook = g_glossHook(inputTarget,
-                              reinterpret_cast<void*>(&HookGetEvent),
-                              reinterpret_cast<void**>(&g_oldGetEvent));
-    if (!g_inputHook || !g_oldGetEvent) {
-        LOGE("input hook install failed");
-        return;
+    g_swapHook = g_glossHook(target,
+                             reinterpret_cast<void*>(&HookSwapInputBuffers),
+                             reinterpret_cast<void**>(&g_oldSwapInputBuffers));
+    if (!g_swapHook || !g_oldSwapInputBuffers) {
+        LOGE("GameActivity swap-input hook install failed target=%p", target);
+        return false;
     }
-    LOGI("installed input-only probe: no Minecraft renderer functions are hooked");
-    LOGI("test order: open inventory, move mouse over preview, then drag finger in the same area");
+
+    LOGI("installed GameActivity input-buffer probe target=%p; AInputQueue hook removed", target);
+    LOGI("test: inventory open -> move mouse over character -> drag finger in same area");
+    return true;
 }
 
 void* InitThread(void*) {
-    LOGI("module loaded: JsonUI pointer input probe v2 (renderer hooks disabled)");
+    LOGI("module loaded: JsonUI pointer probe v3 (GameActivity input buffer)");
     if (!ResolvePreloaderApi()) {
         return nullptr;
     }
-    InstallInputProbe();
+    InstallGameActivityInputProbe();
     return nullptr;
 }
 
