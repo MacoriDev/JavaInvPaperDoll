@@ -8,9 +8,11 @@ on:
 permissions:
   contents: write
 
+# Release/tag를 갱신 중인 실행을 중간에 취소하지 않음.
+# 같은 브랜치의 rolling release를 동시에 수정하는 충돌을 피한다.
 concurrency:
   group: inventory-touch-follow-release-${{ github.ref_name }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 env:
   NDK_VERSION: 27.2.12479018
@@ -72,25 +74,53 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+
           TAG="continuous-${GITHUB_REF_NAME}"
           TITLE="${MODULE_NAME} continuous (${GITHUB_REF_NAME})"
           NOTES="Automatic ARM64 test build from commit ${GITHUB_SHA}. This is a JsonUI GameActivity input probe build; it logs mouse and touch motion events without changing Minecraft rendering or input."
 
-          git tag --force "$TAG" "$GITHUB_SHA"
-          git push origin "refs/tags/${TAG}" --force
+          retry() {
+            local tries=0
+            local max=3
+            until "$@"; do
+              tries=$((tries + 1))
+              if [ "$tries" -ge "$max" ]; then
+                echo "Command failed after ${max} attempts: $*" >&2
+                return 1
+              fi
+              echo "Temporary GitHub operation failure; retrying ($((tries + 1))/${max})..." >&2
+              sleep $((tries * 5))
+            done
+          }
 
           if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" \
+            # git push --force로 rolling tag를 이동시키면 GitHub가 가끔
+            # 'remote: fatal error in commit_refs'를 반환한다.
+            # 공식 Git reference API로 tag가 최신 커밋을 가리키게 갱신한다.
+            retry gh api --method PATCH \
+              -H "Accept: application/vnd.github+json" \
+              "repos/${GITHUB_REPOSITORY}/git/refs/tags/${TAG}" \
+              -f sha="${GITHUB_SHA}" \
+              -F force=true \
+              --silent
+
+            retry gh release upload "$TAG" \
               "dist/${MODULE_NAME}-arm64-v8a.zip" \
               "dist/lib${MODULE_NAME}.so" \
               "dist/lib${MODULE_NAME}.so.sha256" \
               --clobber
-            gh release edit "$TAG" --title "$TITLE" --notes "$NOTES" --prerelease
+
+            retry gh release edit "$TAG" \
+              --title "$TITLE" \
+              --notes "$NOTES" \
+              --prerelease
           else
-            gh release create "$TAG" \
+            # 태그/릴리즈가 아직 없으면 GitHub CLI가 현재 커밋에 새 태그를 생성한다.
+            retry gh release create "$TAG" \
               "dist/${MODULE_NAME}-arm64-v8a.zip" \
               "dist/lib${MODULE_NAME}.so" \
               "dist/lib${MODULE_NAME}.so.sha256" \
+              --target "$GITHUB_SHA" \
               --title "$TITLE" \
               --notes "$NOTES" \
               --prerelease
