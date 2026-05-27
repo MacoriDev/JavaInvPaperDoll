@@ -10,17 +10,22 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 
 namespace {
 
 constexpr const char* kLogTag = "InventoryTouchFollow";
 constexpr const char* kPreloaderLibrary = "libpreloader.so";
 constexpr const char* kMinecraftLibrary = "libminecraftpe.so";
-constexpr std::int64_t kMotionLogIntervalNs = 100'000'000LL;
-constexpr std::int64_t kRewriteLogIntervalNs = 150'000'000LL;
 
-// Confirmed from the supplied libminecraftpe.so / v3 logging.
-constexpr std::size_t kEventDeviceIdOffset = 0x00;
+// Supplied libminecraftpe.so target: LivePlayerRenderer helper that calculates
+// two float look offsets from the current cursor position.
+constexpr std::uintptr_t kLivePlayerLookOffsetHelperRva = 0x097B8AB4u;
+constexpr std::uint32_t kLookOffsetSignature[] = {
+    0xFC1B0FEA, 0x6D00A3E9, 0xA901FBFD, 0xF90017F7
+};
+
+// Confirmed GameActivityMotionEvent layout from the supplied binary and v3/v4 logs.
 constexpr std::size_t kEventSourceOffset = 0x04;
 constexpr std::size_t kEventActionOffset = 0x08;
 constexpr std::size_t kEventPointerCountOffset = 0x38;
@@ -35,32 +40,23 @@ constexpr std::int32_t kActionMask = 0xFF;
 constexpr std::int32_t kActionPointerIndexMask = 0xFF00;
 constexpr std::int32_t kActionPointerIndexShift = 8;
 constexpr std::int32_t kSourceTouchscreen = 0x00001002;
-constexpr std::int32_t kSourceMouse = 0x00002002;
+constexpr std::int32_t kToolFinger = 1;
 
-// S23 Ultra landscape/raw coordinates (3088 x 1440).
-// Entire two-panel JsonUI inventory window from the supplied screenshot/log test.
-// The close X button stays outside this region so the inventory can still be closed.
+constexpr std::int32_t kActionDown = 0;
+constexpr std::int32_t kActionUp = 1;
+constexpr std::int32_t kActionMove = 2;
+constexpr std::int32_t kActionCancel = 3;
+
+// S23 Ultra landscape/raw coordinates (3088 x 1440), based on the user's JsonUI screen.
+// Tracking only begins inside the two inventory panels; after a DOWN, dragging may leave it.
 constexpr float kInventoryLeft = 385.0f;
 constexpr float kInventoryTop = 215.0f;
 constexpr float kInventoryRight = 2510.0f;
 constexpr float kInventoryBottom = 1225.0f;
 
-enum : std::int32_t {
-    ACTION_DOWN = 0,
-    ACTION_UP = 1,
-    ACTION_MOVE = 2,
-    ACTION_CANCEL = 3,
-    ACTION_POINTER_DOWN = 5,
-    ACTION_POINTER_UP = 6,
-    ACTION_HOVER_MOVE = 7,
-    ACTION_HOVER_ENTER = 9,
-    ACTION_HOVER_EXIT = 10,
-};
-
-enum : std::int32_t {
-    TOOL_FINGER = 1,
-    TOOL_MOUSE = 3,
-};
+// Keep a tap visible to a render frame even when DOWN/UP arrives between two frames.
+constexpr std::int64_t kTapHoldAfterUpNs = 300'000'000LL;
+constexpr std::int64_t kRenderLogIntervalNs = 250'000'000LL;
 
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, kLogTag, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, kLogTag, __VA_ARGS__)
@@ -71,23 +67,25 @@ using GlossInitFn = void (*)(bool);
 using GlossHookFn = GHook (*)(void*, void*, void**);
 using MotionEventFromJavaFn = void (*)(JNIEnv*, jobject, std::byte*);
 
+// ABI observed at LivePlayerRenderer's two call sites:
+// x0=float* outputX, x1=float* outputY, x2/x3/x4 opaque render/UI objects,
+// first two floating arguments arrive in s0/s1 and are used as model-center X/Y.
+using LivePlayerLookOffsetFn = void (*)(float*, float*, void*, void*, void*, float, float);
+
 GlossInitFn g_glossInit = nullptr;
 GlossHookFn g_glossHook = nullptr;
 MotionEventFromJavaFn g_oldMotionEventFromJava = nullptr;
-GHook g_motionFromJavaHook = nullptr;
+LivePlayerLookOffsetFn g_oldLivePlayerLookOffset = nullptr;
+GHook g_motionHook = nullptr;
+GHook g_lookHook = nullptr;
 
-std::atomic<std::int64_t> g_lastMotionLogNs{0};
-std::atomic<std::int64_t> g_lastRewriteLogNs{0};
-std::atomic<std::uint64_t> g_motionCount{0};
-std::atomic<std::uint64_t> g_rewriteCount{0};
-std::atomic<bool> g_warnedNoMouse{false};
-std::atomic<bool> g_warnedMultiTouch{false};
-
-// GameActivity converts events on one input/JNI path in this build.
-bool g_inventoryDragActive = false;
-std::int32_t g_inventoryDragPointerId = -1;
-bool g_haveRealMouseDevice = false;
-std::int32_t g_realMouseDeviceId = -1;
+std::atomic<bool> g_followTouch{false};
+std::atomic<std::int32_t> g_followPointerId{-1};
+std::atomic<std::uint32_t> g_touchXBits{0};
+std::atomic<std::uint32_t> g_touchYBits{0};
+std::atomic<std::int64_t> g_touchValidUntilNs{0};
+std::atomic<std::int64_t> g_lastRenderLogNs{0};
+std::atomic<std::uint64_t> g_overrideFrames{0};
 
 std::int64_t NowNs() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -101,9 +99,16 @@ T ReadValue(const std::byte* base, std::size_t offset) {
     return value;
 }
 
-template <typename T>
-void WriteValue(std::byte* base, std::size_t offset, T value) {
-    std::memcpy(base + offset, &value, sizeof(T));
+std::uint32_t FloatBits(float value) {
+    std::uint32_t bits{};
+    std::memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
+float BitsFloat(std::uint32_t bits) {
+    float value{};
+    std::memcpy(&value, &bits, sizeof(value));
+    return value;
 }
 
 template <typename T>
@@ -111,157 +116,66 @@ T Symbol(void* library, const char* name) {
     return reinterpret_cast<T>(dlsym(library, name));
 }
 
-const char* ActionName(std::int32_t action) {
-    switch (action) {
-        case ACTION_DOWN: return "DOWN";
-        case ACTION_UP: return "UP";
-        case ACTION_MOVE: return "MOVE";
-        case ACTION_CANCEL: return "CANCEL";
-        case ACTION_POINTER_DOWN: return "POINTER_DOWN";
-        case ACTION_POINTER_UP: return "POINTER_UP";
-        case ACTION_HOVER_MOVE: return "HOVER_MOVE";
-        case ACTION_HOVER_ENTER: return "HOVER_ENTER";
-        case ACTION_HOVER_EXIT: return "HOVER_EXIT";
-        default: return "OTHER";
-    }
-}
-
 bool IsInsideInventoryWindow(float x, float y) {
     return x >= kInventoryLeft && x <= kInventoryRight &&
            y >= kInventoryTop && y <= kInventoryBottom;
 }
 
-bool ShouldLog(std::atomic<std::int64_t>& last, std::int64_t interval) {
-    const std::int64_t now = NowNs();
-    std::int64_t previous = last.load(std::memory_order_relaxed);
-    if (now - previous < interval) {
-        return false;
-    }
-    return last.compare_exchange_strong(previous, now, std::memory_order_relaxed);
+void SaveTouch(float x, float y) {
+    g_touchXBits.store(FloatBits(x), std::memory_order_relaxed);
+    g_touchYBits.store(FloatBits(y), std::memory_order_relaxed);
 }
 
-void LogMotion(const std::byte* event) {
+void TrackTouchWithoutModifyingEvent(const std::byte* event) {
+    const std::int32_t source = ReadValue<std::int32_t>(event, kEventSourceOffset);
     const std::int32_t actionRaw = ReadValue<std::int32_t>(event, kEventActionOffset);
     const std::int32_t action = actionRaw & kActionMask;
-    if ((action == ACTION_MOVE || action == ACTION_HOVER_MOVE) &&
-        !ShouldLog(g_lastMotionLogNs, kMotionLogIntervalNs)) {
+    const std::int32_t pointerCount = ReadValue<std::int32_t>(event, kEventPointerCountOffset);
+    if (source != kSourceTouchscreen || pointerCount < 1 || pointerCount > 8) {
         return;
     }
 
-    const std::int32_t pointerCount = ReadValue<std::int32_t>(event, kEventPointerCountOffset);
-    if (pointerCount < 1 || pointerCount > 8) {
-        return;
-    }
     std::int32_t index = (actionRaw & kActionPointerIndexMask) >> kActionPointerIndexShift;
     if (index < 0 || index >= pointerCount) {
         index = 0;
     }
     const std::size_t pointer = kFirstPointerOffset + static_cast<std::size_t>(index) * kPointerStride;
-    const std::int32_t deviceId = ReadValue<std::int32_t>(event, kEventDeviceIdOffset);
-    const std::int32_t source = ReadValue<std::int32_t>(event, kEventSourceOffset);
     const std::int32_t tool = ReadValue<std::int32_t>(event, pointer + kPointerToolTypeOffset);
     const std::int32_t pointerId = ReadValue<std::int32_t>(event, pointer + kPointerIdOffset);
     const float x = ReadValue<float>(event, pointer + kPointerAxisXOffset);
     const float y = ReadValue<float>(event, pointer + kPointerAxisYOffset);
-    const std::uint64_t count = g_motionCount.fetch_add(1, std::memory_order_relaxed) + 1;
-
-    LOGI("RAW #%" PRIu64 " action=%s(%d) source=0x%08x tool=%d device=%d pointerId=%d pos=(%.1f,%.1f)",
-         count, ActionName(action), action, static_cast<unsigned>(source), tool, deviceId,
-         pointerId, static_cast<double>(x), static_cast<double>(y));
-}
-
-// v4 appended a memcpy-copy of GameActivityMotionEvent into the swapped read buffer.
-// That event owns history pointers and gets destroyed later, so copying it can double-free.
-// v4.2 keeps the v4.1 crash fix: it never appends or copies an event and rewrites one newly produced event.
-bool RewriteSingleFingerAsMouse(std::byte* event, std::int32_t newAction) {
-    const std::int32_t pointerCount = ReadValue<std::int32_t>(event, kEventPointerCountOffset);
-    if (pointerCount != 1) {
-        if (!g_warnedMultiTouch.exchange(true, std::memory_order_relaxed)) {
-            LOGW("touch-follow disabled for multi-touch event: pointerCount=%d", pointerCount);
-        }
-        return false;
-    }
-    if (!g_haveRealMouseDevice) {
-        if (!g_warnedNoMouse.exchange(true, std::memory_order_relaxed)) {
-            LOGW("move the connected mouse once before using touch-follow; real mouse device id not captured");
-        }
-        return false;
+    if (tool != kToolFinger) {
+        return;
     }
 
-    WriteValue<std::int32_t>(event, kEventDeviceIdOffset, g_realMouseDeviceId);
-    WriteValue<std::int32_t>(event, kEventSourceOffset, kSourceMouse);
-    WriteValue<std::int32_t>(event, kEventActionOffset, newAction);
-    WriteValue<std::int32_t>(event, kFirstPointerOffset + kPointerToolTypeOffset, TOOL_MOUSE);
+    if (action == kActionDown && pointerCount == 1 && IsInsideInventoryWindow(x, y)) {
+        SaveTouch(x, y);
+        g_followPointerId.store(pointerId, std::memory_order_relaxed);
+        g_followTouch.store(true, std::memory_order_release);
+        g_touchValidUntilNs.store(std::numeric_limits<std::int64_t>::max(), std::memory_order_relaxed);
+        LOGI("TOUCH TRACK START pointerId=%d pos=(%.1f,%.1f); original TOUCH event preserved",
+             pointerId, static_cast<double>(x), static_cast<double>(y));
+        return;
+    }
 
-    const float x = ReadValue<float>(event, kFirstPointerOffset + kPointerAxisXOffset);
-    const float y = ReadValue<float>(event, kFirstPointerOffset + kPointerAxisYOffset);
-    const std::uint64_t count = g_rewriteCount.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (newAction != ACTION_HOVER_MOVE || ShouldLog(g_lastRewriteLogNs, kRewriteLogIntervalNs)) {
-        LOGI("REWRITE #%" PRIu64 " -> %s device=%d pos=(%.1f,%.1f)",
-             count, ActionName(newAction), g_realMouseDeviceId,
+    if (!g_followTouch.load(std::memory_order_acquire) ||
+        pointerId != g_followPointerId.load(std::memory_order_relaxed) ||
+        pointerCount != 1) {
+        return;
+    }
+
+    if (action == kActionMove) {
+        SaveTouch(x, y);
+        return;
+    }
+
+    if (action == kActionUp || action == kActionCancel) {
+        SaveTouch(x, y);
+        g_followTouch.store(false, std::memory_order_release);
+        g_touchValidUntilNs.store(NowNs() + kTapHoldAfterUpNs, std::memory_order_relaxed);
+        g_followPointerId.store(-1, std::memory_order_relaxed);
+        LOGI("TOUCH TRACK END pos=(%.1f,%.1f); tap/click remains TOUCH",
              static_cast<double>(x), static_cast<double>(y));
-    }
-    return true;
-}
-
-void ProcessProducedMotion(std::byte* event) {
-    const std::int32_t actionRaw = ReadValue<std::int32_t>(event, kEventActionOffset);
-    const std::int32_t action = actionRaw & kActionMask;
-    const std::int32_t source = ReadValue<std::int32_t>(event, kEventSourceOffset);
-    const std::int32_t pointerCount = ReadValue<std::int32_t>(event, kEventPointerCountOffset);
-    if (pointerCount < 1 || pointerCount > 8) {
-        return;
-    }
-
-    std::int32_t index = (actionRaw & kActionPointerIndexMask) >> kActionPointerIndexShift;
-    if (index < 0 || index >= pointerCount) {
-        index = 0;
-    }
-    const std::size_t pointer = kFirstPointerOffset + static_cast<std::size_t>(index) * kPointerStride;
-    const std::int32_t tool = ReadValue<std::int32_t>(event, pointer + kPointerToolTypeOffset);
-    const std::int32_t pointerId = ReadValue<std::int32_t>(event, pointer + kPointerIdOffset);
-    const float x = ReadValue<float>(event, pointer + kPointerAxisXOffset);
-    const float y = ReadValue<float>(event, pointer + kPointerAxisYOffset);
-
-    if (source == kSourceMouse && tool == TOOL_MOUSE) {
-        const std::int32_t deviceId = ReadValue<std::int32_t>(event, kEventDeviceIdOffset);
-        if (!g_haveRealMouseDevice || g_realMouseDeviceId != deviceId) {
-            g_haveRealMouseDevice = true;
-            g_realMouseDeviceId = deviceId;
-            LOGI("captured real absolute mouse device=%d", deviceId);
-        }
-        return;
-    }
-
-    if (source != kSourceTouchscreen || tool != TOOL_FINGER) {
-        return;
-    }
-
-    if (action == ACTION_DOWN && pointerCount == 1 && IsInsideInventoryWindow(x, y)) {
-        if (RewriteSingleFingerAsMouse(event, ACTION_HOVER_ENTER)) {
-            g_inventoryDragActive = true;
-            g_inventoryDragPointerId = pointerId;
-            LOGI("inventory touch-follow START pointerId=%d pos=(%.1f,%.1f)",
-                 pointerId, static_cast<double>(x), static_cast<double>(y));
-        }
-        return;
-    }
-
-    if (!g_inventoryDragActive || pointerId != g_inventoryDragPointerId || pointerCount != 1) {
-        return;
-    }
-
-    if (action == ACTION_MOVE) {
-        RewriteSingleFingerAsMouse(event, ACTION_HOVER_MOVE);
-        return;
-    }
-
-    if (action == ACTION_UP || action == ACTION_CANCEL) {
-        RewriteSingleFingerAsMouse(event, ACTION_HOVER_EXIT);
-        LOGI("inventory touch-follow END pointerId=%d pos=(%.1f,%.1f)",
-             g_inventoryDragPointerId, static_cast<double>(x), static_cast<double>(y));
-        g_inventoryDragActive = false;
-        g_inventoryDragPointerId = -1;
     }
 }
 
@@ -269,14 +183,59 @@ void HookMotionEventFromJava(JNIEnv* env, jobject javaMotionEvent, std::byte* ou
     if (!g_oldMotionEventFromJava) {
         return;
     }
-
     g_oldMotionEventFromJava(env, javaMotionEvent, outEvent);
-    if (!outEvent) {
+    if (outEvent) {
+        TrackTouchWithoutModifyingEvent(outEvent);
+    }
+}
+
+bool IsTouchLookActive() {
+    return g_followTouch.load(std::memory_order_acquire) ||
+           NowNs() <= g_touchValidUntilNs.load(std::memory_order_relaxed);
+}
+
+void HookLivePlayerLookOffset(
+    float* outX,
+    float* outY,
+    void* arg2,
+    void* arg3,
+    void* arg4,
+    float modelCenterX,
+    float modelCenterY) {
+
+    if (!g_oldLivePlayerLookOffset) {
         return;
     }
 
-    LogMotion(outEvent);          // log before any change
-    ProcessProducedMotion(outEvent);
+    // Keep all original renderer behavior first. We replace only its final local look offsets.
+    g_oldLivePlayerLookOffset(outX, outY, arg2, arg3, arg4, modelCenterX, modelCenterY);
+
+    if (!outX || !outY || !IsTouchLookActive()) {
+        return;
+    }
+
+    const float touchX = BitsFloat(g_touchXBits.load(std::memory_order_relaxed));
+    const float touchY = BitsFloat(g_touchYBits.load(std::memory_order_relaxed));
+
+    // Derived from the original helper's cursor path:
+    // outputX = modelCenterX - pointerX; outputY = modelCenterY - pointerY.
+    const float originalX = *outX;
+    const float originalY = *outY;
+    *outX = modelCenterX - touchX;
+    *outY = modelCenterY - touchY;
+
+    const std::uint64_t frame = g_overrideFrames.fetch_add(1, std::memory_order_relaxed) + 1;
+    const std::int64_t now = NowNs();
+    std::int64_t previous = g_lastRenderLogNs.load(std::memory_order_relaxed);
+    if (now - previous >= kRenderLogIntervalNs &&
+        g_lastRenderLogNs.compare_exchange_strong(previous, now, std::memory_order_relaxed)) {
+        LOGI("RENDER LOOK #%" PRIu64 " center=(%.1f,%.1f) touch=(%.1f,%.1f) original=(%.1f,%.1f) override=(%.1f,%.1f)",
+             frame,
+             static_cast<double>(modelCenterX), static_cast<double>(modelCenterY),
+             static_cast<double>(touchX), static_cast<double>(touchY),
+             static_cast<double>(originalX), static_cast<double>(originalY),
+             static_cast<double>(*outX), static_cast<double>(*outY));
+    }
 }
 
 bool ResolvePreloaderApi() {
@@ -305,7 +264,7 @@ bool ResolvePreloaderApi() {
     return true;
 }
 
-bool InstallMotionProducerRewrite() {
+bool InstallHooks() {
 #ifndef RTLD_NOLOAD
 #define RTLD_NOLOAD 0x00004
 #endif
@@ -315,37 +274,58 @@ bool InstallMotionProducerRewrite() {
         return false;
     }
 
-    void* target = dlsym(minecraft, "GameActivityMotionEvent_fromJava");
-    if (!target) {
+    void* motionTarget = dlsym(minecraft, "GameActivityMotionEvent_fromJava");
+    if (!motionTarget) {
         LOGE("GameActivityMotionEvent_fromJava export not found");
         return false;
     }
 
-    g_motionFromJavaHook = g_glossHook(
-        target,
-        reinterpret_cast<void*>(&HookMotionEventFromJava),
-        reinterpret_cast<void**>(&g_oldMotionEventFromJava));
-    if (!g_motionFromJavaHook || !g_oldMotionEventFromJava) {
-        LOGE("motion producer hook install failed target=%p", target);
+    Dl_info moduleInfo{};
+    if (dladdr(motionTarget, &moduleInfo) == 0 || !moduleInfo.dli_fbase) {
+        LOGE("unable to determine libminecraftpe.so base");
         return false;
     }
 
-    LOGI("installed v4.2 GameActivityMotionEvent_fromJava rewrite hook target=%p", target);
-    LOGI("safe change: no swapped-buffer append and no GameActivityMotionEvent memcpy");
-    LOGI("whole inventory follow bounds raw=(%.0f,%.0f)-(%.0f,%.0f)",
+    auto* base = reinterpret_cast<std::byte*>(moduleInfo.dli_fbase);
+    void* lookTarget = base + kLivePlayerLookOffsetHelperRva;
+    if (std::memcmp(lookTarget, kLookOffsetSignature, sizeof(kLookOffsetSignature)) != 0) {
+        LOGE("look-offset helper signature mismatch at RVA 0x%" PRIxPTR "; refusing unsafe hook",
+             kLivePlayerLookOffsetHelperRva);
+        return false;
+    }
+
+    g_lookHook = g_glossHook(
+        lookTarget,
+        reinterpret_cast<void*>(&HookLivePlayerLookOffset),
+        reinterpret_cast<void**>(&g_oldLivePlayerLookOffset));
+    if (!g_lookHook || !g_oldLivePlayerLookOffset) {
+        LOGE("LivePlayerRenderer look-offset helper hook failed target=%p", lookTarget);
+        return false;
+    }
+
+    g_motionHook = g_glossHook(
+        motionTarget,
+        reinterpret_cast<void*>(&HookMotionEventFromJava),
+        reinterpret_cast<void**>(&g_oldMotionEventFromJava));
+    if (!g_motionHook || !g_oldMotionEventFromJava) {
+        LOGE("touch observer hook failed target=%p; renderer override will remain idle", motionTarget);
+        return false;
+    }
+
+    LOGI("installed v5 renderer-side look override; motionTarget=%p lookTarget=%p", motionTarget, lookTarget);
+    LOGI("input-mode safe design: GameActivity touch events are observed only, never rewritten as mouse");
+    LOGI("inventory follow start bounds raw=(%.0f,%.0f)-(%.0f,%.0f)",
          static_cast<double>(kInventoryLeft), static_cast<double>(kInventoryTop),
          static_cast<double>(kInventoryRight), static_cast<double>(kInventoryBottom));
-    LOGW("v4.2 test build: bounds are coordinate-gated, not yet inventory-screen-state gated");
-    LOGI("test: inventory -> move connected mouse once -> touch-drag anywhere inside inventory panels");
+    LOGI("test WITHOUT a connected mouse: inventory -> touch/drag slots or recipe book controls");
     return true;
 }
 
 void* InitThread(void*) {
-    LOGI("module loaded: JsonUI whole-inventory touch follow v4.2 (producer in-place rewrite)");
-    if (!ResolvePreloaderApi()) {
-        return nullptr;
+    LOGI("module loaded: JsonUI inventory touch follow v5 (renderer-side; touch preserved)");
+    if (ResolvePreloaderApi()) {
+        InstallHooks();
     }
-    InstallMotionProducerRewrite();
     return nullptr;
 }
 
