@@ -10,7 +10,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <limits>
 
 namespace {
 
@@ -47,15 +46,8 @@ constexpr std::int32_t kActionUp = 1;
 constexpr std::int32_t kActionMove = 2;
 constexpr std::int32_t kActionCancel = 3;
 
-// S23 Ultra landscape/raw coordinates (3088 x 1440), based on the user's JsonUI screen.
-// Tracking only begins inside the two inventory panels; after a DOWN, dragging may leave it.
-constexpr float kInventoryLeft = 385.0f;
-constexpr float kInventoryTop = 215.0f;
-constexpr float kInventoryRight = 2510.0f;
-constexpr float kInventoryBottom = 1225.0f;
-
-// Keep a tap visible to a render frame even when DOWN/UP arrives between two frames.
-constexpr std::int64_t kTapHoldAfterUpNs = 300'000'000LL;
+// v5.2 intentionally accepts touch positions from the entire screen.
+// The model renderer uses the most recent touch position and keeps it after release.
 constexpr std::int64_t kRenderLogIntervalNs = 250'000'000LL;
 
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, kLogTag, __VA_ARGS__)
@@ -80,10 +72,10 @@ GHook g_motionHook = nullptr;
 GHook g_lookHook = nullptr;
 
 std::atomic<bool> g_followTouch{false};
+std::atomic<bool> g_haveLastTouch{false};
 std::atomic<std::int32_t> g_followPointerId{-1};
 std::atomic<std::uint32_t> g_touchXBits{0};
 std::atomic<std::uint32_t> g_touchYBits{0};
-std::atomic<std::int64_t> g_touchValidUntilNs{0};
 std::atomic<std::int64_t> g_lastRenderLogNs{0};
 std::atomic<std::uint64_t> g_overrideFrames{0};
 
@@ -132,11 +124,6 @@ T Symbol(void* library, const char* name) {
     return reinterpret_cast<T>(dlsym(library, name));
 }
 
-bool IsInsideInventoryWindow(float x, float y) {
-    return x >= kInventoryLeft && x <= kInventoryRight &&
-           y >= kInventoryTop && y <= kInventoryBottom;
-}
-
 void SaveTouch(float x, float y) {
     g_touchXBits.store(FloatBits(x), std::memory_order_relaxed);
     g_touchYBits.store(FloatBits(y), std::memory_order_relaxed);
@@ -164,12 +151,12 @@ void TrackTouchWithoutModifyingEvent(const std::byte* event) {
         return;
     }
 
-    if (action == kActionDown && pointerCount == 1 && IsInsideInventoryWindow(x, y)) {
+    if (action == kActionDown && pointerCount == 1) {
         SaveTouch(x, y);
+        g_haveLastTouch.store(true, std::memory_order_release);
         g_followPointerId.store(pointerId, std::memory_order_relaxed);
         g_followTouch.store(true, std::memory_order_release);
-        g_touchValidUntilNs.store(std::numeric_limits<std::int64_t>::max(), std::memory_order_relaxed);
-        LOGI("TOUCH TRACK START pointerId=%d pos=(%.1f,%.1f); original TOUCH event preserved",
+        LOGI("FULLSCREEN TOUCH START pointerId=%d pos=(%.1f,%.1f); original TOUCH event preserved",
              pointerId, static_cast<double>(x), static_cast<double>(y));
         return;
     }
@@ -188,9 +175,8 @@ void TrackTouchWithoutModifyingEvent(const std::byte* event) {
     if (action == kActionUp || action == kActionCancel) {
         SaveTouch(x, y);
         g_followTouch.store(false, std::memory_order_release);
-        g_touchValidUntilNs.store(NowNs() + kTapHoldAfterUpNs, std::memory_order_relaxed);
         g_followPointerId.store(-1, std::memory_order_relaxed);
-        LOGI("TOUCH TRACK END pos=(%.1f,%.1f); tap/click remains TOUCH",
+        LOGI("FULLSCREEN TOUCH END pos=(%.1f,%.1f); gaze is held at last touch and tap/click remains TOUCH",
              static_cast<double>(x), static_cast<double>(y));
     }
 }
@@ -206,8 +192,8 @@ void HookMotionEventFromJava(JNIEnv* env, jobject javaMotionEvent, std::byte* ou
 }
 
 bool IsTouchLookActive() {
-    return g_followTouch.load(std::memory_order_acquire) ||
-           NowNs() <= g_touchValidUntilNs.load(std::memory_order_relaxed);
+    // Remain at the final touch position after release until a later touch updates it.
+    return g_haveLastTouch.load(std::memory_order_acquire);
 }
 
 void HookLivePlayerLookOffset(
@@ -237,24 +223,22 @@ void HookLivePlayerLookOffset(
         return;
     }
 
-    // Native mouse path, recovered from the supplied ARM64 binary:
-    //   outX = signedShortMouseX * nativeScale - modelCenterX
-    //   outY = modelCenterY - signedShortMouseY * nativeScale
-    // v5 incorrectly used raw Android pixels directly and reversed X, causing
-    // huge saturated values such as (-1933, -647) and unnatural movement.
+    // v5.1 matched the native coordinate scale, but touch drove both model axes in
+    // the opposite direction on-device. Keep the native scaling and invert both
+    // look offsets around the same center.
     const float nativeTouchX = static_cast<float>(static_cast<std::int16_t>(touchX));
     const float nativeTouchY = static_cast<float>(static_cast<std::int16_t>(touchY));
     const float originalX = *outX;
     const float originalY = *outY;
-    *outX = nativeTouchX * nativeScale - modelCenterX;
-    *outY = modelCenterY - nativeTouchY * nativeScale;
+    *outX = modelCenterX - nativeTouchX * nativeScale;
+    *outY = nativeTouchY * nativeScale - modelCenterY;
 
     const std::uint64_t frame = g_overrideFrames.fetch_add(1, std::memory_order_relaxed) + 1;
     const std::int64_t now = NowNs();
     std::int64_t previous = g_lastRenderLogNs.load(std::memory_order_relaxed);
     if (now - previous >= kRenderLogIntervalNs &&
         g_lastRenderLogNs.compare_exchange_strong(previous, now, std::memory_order_relaxed)) {
-        LOGI("NATIVE LOOK #%" PRIu64 " scale=%.5f center=(%.1f,%.1f) touchRaw=(%.1f,%.1f) original=(%.1f,%.1f) override=(%.1f,%.1f)",
+        LOGI("NATIVE LOOK INVERTED #%" PRIu64 " scale=%.5f center=(%.1f,%.1f) touchRaw=(%.1f,%.1f) original=(%.1f,%.1f) override=(%.1f,%.1f)",
              frame,
              static_cast<double>(nativeScale),
              static_cast<double>(modelCenterX), static_cast<double>(modelCenterY),
@@ -338,17 +322,16 @@ bool InstallHooks() {
         return false;
     }
 
-    LOGI("installed v5.1 native-scale renderer-side look override; motionTarget=%p lookTarget=%p", motionTarget, lookTarget);
-    LOGI("input-mode safe design: TOUCH events preserved; renderer now applies original mouse coordinate scale/sign formula");
-    LOGI("inventory follow start bounds raw=(%.0f,%.0f)-(%.0f,%.0f)",
-         static_cast<double>(kInventoryLeft), static_cast<double>(kInventoryTop),
-         static_cast<double>(kInventoryRight), static_cast<double>(kInventoryBottom));
-    LOGI("test WITHOUT a connected mouse: inventory -> touch/drag slots or recipe book controls");
+    LOGI("installed v5.2 full-screen held-look renderer override; motionTarget=%p lookTarget=%p", motionTarget, lookTarget);
+    LOGI("input-mode safe design: TOUCH events preserved; no synthetic mouse input is emitted");
+    LOGI("touch follow area: entire screen; gaze hold: persistent after finger release");
+    LOGI("axis correction: v5.1 scaled result inverted on X and Y");
+    LOGI("test WITHOUT a connected mouse: inventory -> tap/drag anywhere on the screen");
     return true;
 }
 
 void* InitThread(void*) {
-    LOGI("module loaded: JsonUI inventory touch follow v5.1 (native mouse math; touch preserved)");
+    LOGI("module loaded: JsonUI inventory touch follow v5.2 (full-screen held-look; touch preserved)");
     if (ResolvePreloaderApi()) {
         InstallHooks();
     }
