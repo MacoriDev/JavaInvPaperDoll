@@ -1,0 +1,97 @@
+name: Build Release Only
+
+on:
+  push:
+    branches: [main, test]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: inventory-touch-follow-release-${{ github.ref_name }}
+  cancel-in-progress: true
+
+env:
+  NDK_VERSION: 27.2.12479018
+  MODULE_NAME: InventoryTouchFollowProbe
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android NDK r27c and Ninja
+        shell: bash
+        run: |
+          set -euo pipefail
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "ndk;${NDK_VERSION}"
+          sudo apt-get update
+          sudo apt-get install -y ninja-build zip
+
+      - name: Configure Android ARM64 Release build
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S . -B build-android -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$ANDROID_SDK_ROOT/ndk/${NDK_VERSION}/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-26 \
+            -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build .so
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake --build build-android --parallel
+
+      - name: Prepare Release files
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist/package
+          cp "build-android/lib${MODULE_NAME}.so" "dist/package/lib${MODULE_NAME}.so"
+          cp README.md dist/package/README.md
+          (cd dist/package && sha256sum "lib${MODULE_NAME}.so" > "lib${MODULE_NAME}.so.sha256")
+          (cd dist/package && zip -9 "../${MODULE_NAME}-arm64-v8a.zip" "lib${MODULE_NAME}.so" "lib${MODULE_NAME}.so.sha256" README.md)
+          cp "dist/package/lib${MODULE_NAME}.so" dist/
+          cp "dist/package/lib${MODULE_NAME}.so.sha256" dist/
+
+      - name: Publish only to rolling GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="continuous-${GITHUB_REF_NAME}"
+          TITLE="${MODULE_NAME} continuous (${GITHUB_REF_NAME})"
+          NOTES="Automatic ARM64 test build from commit ${GITHUB_SHA}. This is a JsonUI inventory preview probe build; it logs LivePlayerRenderer/PaperDollRenderer calls and touch coordinates."
+
+          git tag --force "$TAG" "$GITHUB_SHA"
+          git push origin "refs/tags/${TAG}" --force
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" \
+              "dist/${MODULE_NAME}-arm64-v8a.zip" \
+              "dist/lib${MODULE_NAME}.so" \
+              "dist/lib${MODULE_NAME}.so.sha256" \
+              --clobber
+            gh release edit "$TAG" --title "$TITLE" --notes "$NOTES" --prerelease
+          else
+            gh release create "$TAG" \
+              "dist/${MODULE_NAME}-arm64-v8a.zip" \
+              "dist/lib${MODULE_NAME}.so" \
+              "dist/lib${MODULE_NAME}.so.sha256" \
+              --title "$TITLE" \
+              --notes "$NOTES" \
+              --prerelease
+          fi
