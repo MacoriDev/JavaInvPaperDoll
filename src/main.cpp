@@ -37,11 +37,13 @@ constexpr std::int32_t kActionPointerIndexShift = 8;
 constexpr std::int32_t kSourceTouchscreen = 0x00001002;
 constexpr std::int32_t kSourceMouse = 0x00002002;
 
-// S23 Ultra landscape/raw coordinates. Start on the paper-doll torso/head.
-constexpr float kPreviewLeft = 1580.0f;
-constexpr float kPreviewTop = 220.0f;
-constexpr float kPreviewRight = 1950.0f;
-constexpr float kPreviewBottom = 760.0f;
+// S23 Ultra landscape/raw coordinates (3088 x 1440).
+// Entire two-panel JsonUI inventory window from the supplied screenshot/log test.
+// The close X button stays outside this region so the inventory can still be closed.
+constexpr float kInventoryLeft = 385.0f;
+constexpr float kInventoryTop = 215.0f;
+constexpr float kInventoryRight = 2510.0f;
+constexpr float kInventoryBottom = 1225.0f;
 
 enum : std::int32_t {
     ACTION_DOWN = 0,
@@ -82,8 +84,8 @@ std::atomic<bool> g_warnedNoMouse{false};
 std::atomic<bool> g_warnedMultiTouch{false};
 
 // GameActivity converts events on one input/JNI path in this build.
-bool g_previewDragActive = false;
-std::int32_t g_previewDragPointerId = -1;
+bool g_inventoryDragActive = false;
+std::int32_t g_inventoryDragPointerId = -1;
 bool g_haveRealMouseDevice = false;
 std::int32_t g_realMouseDeviceId = -1;
 
@@ -124,9 +126,9 @@ const char* ActionName(std::int32_t action) {
     }
 }
 
-bool IsInsidePreview(float x, float y) {
-    return x >= kPreviewLeft && x <= kPreviewRight &&
-           y >= kPreviewTop && y <= kPreviewBottom;
+bool IsInsideInventoryWindow(float x, float y) {
+    return x >= kInventoryLeft && x <= kInventoryRight &&
+           y >= kInventoryTop && y <= kInventoryBottom;
 }
 
 bool ShouldLog(std::atomic<std::int64_t>& last, std::int64_t interval) {
@@ -170,7 +172,7 @@ void LogMotion(const std::byte* event) {
 
 // v4 appended a memcpy-copy of GameActivityMotionEvent into the swapped read buffer.
 // That event owns history pointers and gets destroyed later, so copying it can double-free.
-// v4.1 never appends or copies an event: it rewrites exactly one newly produced event.
+// v4.2 keeps the v4.1 crash fix: it never appends or copies an event and rewrites one newly produced event.
 bool RewriteSingleFingerAsMouse(std::byte* event, std::int32_t newAction) {
     const std::int32_t pointerCount = ReadValue<std::int32_t>(event, kEventPointerCountOffset);
     if (pointerCount != 1) {
@@ -235,17 +237,17 @@ void ProcessProducedMotion(std::byte* event) {
         return;
     }
 
-    if (action == ACTION_DOWN && pointerCount == 1 && IsInsidePreview(x, y)) {
+    if (action == ACTION_DOWN && pointerCount == 1 && IsInsideInventoryWindow(x, y)) {
         if (RewriteSingleFingerAsMouse(event, ACTION_HOVER_ENTER)) {
-            g_previewDragActive = true;
-            g_previewDragPointerId = pointerId;
-            LOGI("preview touch-follow START pointerId=%d pos=(%.1f,%.1f)",
+            g_inventoryDragActive = true;
+            g_inventoryDragPointerId = pointerId;
+            LOGI("inventory touch-follow START pointerId=%d pos=(%.1f,%.1f)",
                  pointerId, static_cast<double>(x), static_cast<double>(y));
         }
         return;
     }
 
-    if (!g_previewDragActive || pointerId != g_previewDragPointerId || pointerCount != 1) {
+    if (!g_inventoryDragActive || pointerId != g_inventoryDragPointerId || pointerCount != 1) {
         return;
     }
 
@@ -256,10 +258,10 @@ void ProcessProducedMotion(std::byte* event) {
 
     if (action == ACTION_UP || action == ACTION_CANCEL) {
         RewriteSingleFingerAsMouse(event, ACTION_HOVER_EXIT);
-        LOGI("preview touch-follow END pointerId=%d pos=(%.1f,%.1f)",
-             g_previewDragPointerId, static_cast<double>(x), static_cast<double>(y));
-        g_previewDragActive = false;
-        g_previewDragPointerId = -1;
+        LOGI("inventory touch-follow END pointerId=%d pos=(%.1f,%.1f)",
+             g_inventoryDragPointerId, static_cast<double>(x), static_cast<double>(y));
+        g_inventoryDragActive = false;
+        g_inventoryDragPointerId = -1;
     }
 }
 
@@ -328,17 +330,18 @@ bool InstallMotionProducerRewrite() {
         return false;
     }
 
-    LOGI("installed v4.1 GameActivityMotionEvent_fromJava rewrite hook target=%p", target);
+    LOGI("installed v4.2 GameActivityMotionEvent_fromJava rewrite hook target=%p", target);
     LOGI("safe change: no swapped-buffer append and no GameActivityMotionEvent memcpy");
-    LOGI("preview start bounds raw=(%.0f,%.0f)-(%.0f,%.0f)",
-         static_cast<double>(kPreviewLeft), static_cast<double>(kPreviewTop),
-         static_cast<double>(kPreviewRight), static_cast<double>(kPreviewBottom));
-    LOGI("test: inventory -> move connected mouse once -> touch-drag Steve torso/head");
+    LOGI("whole inventory follow bounds raw=(%.0f,%.0f)-(%.0f,%.0f)",
+         static_cast<double>(kInventoryLeft), static_cast<double>(kInventoryTop),
+         static_cast<double>(kInventoryRight), static_cast<double>(kInventoryBottom));
+    LOGW("v4.2 test build: bounds are coordinate-gated, not yet inventory-screen-state gated");
+    LOGI("test: inventory -> move connected mouse once -> touch-drag anywhere inside inventory panels");
     return true;
 }
 
 void* InitThread(void*) {
-    LOGI("module loaded: JsonUI inventory touch follow v4.1 (producer in-place rewrite)");
+    LOGI("module loaded: JsonUI whole-inventory touch follow v4.2 (producer in-place rewrite)");
     if (!ResolvePreloaderApi()) {
         return nullptr;
     }
