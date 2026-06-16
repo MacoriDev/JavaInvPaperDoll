@@ -17,9 +17,19 @@ constexpr const char* kLogTag = "InventoryTouchFollow";
 constexpr const char* kPreloaderLibrary = "libpreloader.so";
 constexpr const char* kMinecraftLibrary = "libminecraftpe.so";
 
-// Supplied libminecraftpe.so target: LivePlayerRenderer helper that calculates
-// two float look offsets from the current cursor position.
-constexpr std::uintptr_t kLivePlayerLookOffsetHelperRva = 0x097B8AB4u;
+// LivePlayerRenderer helper that calculates two float look offsets from the
+// current cursor position. 26.30 moved the helper, but the function body/signature
+// stayed identical to the tested 26.23 build.
+struct LookOffsetCandidate {
+    std::uintptr_t rva;
+    const char* label;
+};
+
+constexpr LookOffsetCandidate kLookOffsetCandidates[] = {
+    {0x09C4B448u, "26.30 / build-id 2dd6f453b4cfadea91a35e498a1055601a22850a"},
+    {0x097B8AB4u, "26.23 / build-id 3e6189ba1d8357ef500d8043bc551406f0aae455"},
+};
+
 constexpr std::uint32_t kLookOffsetSignature[] = {
     0xFC1B0FEA, 0x6D00A3E9, 0xA901FBFD, 0xF90017F7
 };
@@ -122,6 +132,20 @@ float ReadNativePointerScale(void* lookContext) {
 template <typename T>
 T Symbol(void* library, const char* name) {
     return reinterpret_cast<T>(dlsym(library, name));
+}
+
+void* ResolveLookOffsetTarget(std::byte* base) {
+    for (const auto& candidate : kLookOffsetCandidates) {
+        void* target = base + candidate.rva;
+        if (std::memcmp(target, kLookOffsetSignature, sizeof(kLookOffsetSignature)) == 0) {
+            LOGI("matched LivePlayerRenderer look helper %s at RVA 0x%" PRIxPTR,
+                 candidate.label, candidate.rva);
+            return target;
+        }
+        LOGW("look helper candidate mismatch: %s RVA 0x%" PRIxPTR,
+             candidate.label, candidate.rva);
+    }
+    return nullptr;
 }
 
 void SaveTouch(float x, float y) {
@@ -298,10 +322,9 @@ bool InstallHooks() {
     }
 
     auto* base = reinterpret_cast<std::byte*>(moduleInfo.dli_fbase);
-    void* lookTarget = base + kLivePlayerLookOffsetHelperRva;
-    if (std::memcmp(lookTarget, kLookOffsetSignature, sizeof(kLookOffsetSignature)) != 0) {
-        LOGE("look-offset helper signature mismatch at RVA 0x%" PRIxPTR "; refusing unsafe hook",
-             kLivePlayerLookOffsetHelperRva);
+    void* lookTarget = ResolveLookOffsetTarget(base);
+    if (!lookTarget) {
+        LOGE("no supported LivePlayerRenderer look-offset helper matched; refusing unsafe hook");
         return false;
     }
 
@@ -323,7 +346,7 @@ bool InstallHooks() {
         return false;
     }
 
-    LOGI("installed v5.3 full-screen held-look renderer override; motionTarget=%p lookTarget=%p", motionTarget, lookTarget);
+    LOGI("installed v5.4 / MCBE 26.30 full-screen held-look renderer override; motionTarget=%p lookTarget=%p", motionTarget, lookTarget);
     LOGI("input-mode safe design: TOUCH events preserved; no synthetic mouse input is emitted");
     LOGI("touch follow area: entire screen; gaze hold: persistent after finger release");
     LOGI("axis correction: X inverted; Y restored to v5.1 direction");
@@ -332,7 +355,7 @@ bool InstallHooks() {
 }
 
 void* InitThread(void*) {
-    LOGI("module loaded: JsonUI inventory touch follow v5.3 (X-only inversion; full-screen held-look)");
+    LOGI("module loaded: JsonUI inventory touch follow v5.4 for MCBE 26.30 (X-only inversion; full-screen held-look)");
     if (ResolvePreloaderApi()) {
         InstallHooks();
     }
