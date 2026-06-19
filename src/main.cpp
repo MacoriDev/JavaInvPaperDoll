@@ -1,6 +1,7 @@
 #include <android/log.h>
 #include <jni.h>
 #include <dlfcn.h>
+#include <link.h>
 #include <pthread.h>
 #include <unistd.h>
 
@@ -10,6 +11,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <algorithm>
 
 namespace {
 
@@ -18,21 +20,23 @@ constexpr const char* kPreloaderLibrary = "libpreloader.so";
 constexpr const char* kMinecraftLibrary = "libminecraftpe.so";
 
 // LivePlayerRenderer helper that calculates two float look offsets from the
-// current cursor position. 26.30 moved the helper, but the function body/signature
-// stayed identical to the tested 26.23 build.
-struct LookOffsetCandidate {
-    std::uintptr_t rva;
-    const char* label;
-};
-
-constexpr LookOffsetCandidate kLookOffsetCandidates[] = {
-    {0x09C4B448u, "26.30 / build-id 2dd6f453b4cfadea91a35e498a1055601a22850a"},
-    {0x097B8AB4u, "26.23 / build-id 3e6189ba1d8357ef500d8043bc551406f0aae455"},
-};
-
+// current cursor position. v5.5 no longer depends on per-version hardcoded RVAs.
+// It scans executable libminecraftpe segments for the helper's stable prologue
+// and the scale/math instructions used by the native mouse path.
 constexpr std::uint32_t kLookOffsetSignature[] = {
     0xFC1B0FEA, 0x6D00A3E9, 0xA901FBFD, 0xF90017F7
 };
+
+constexpr std::uint32_t kLookOffsetNeedles[] = {
+    0xF9400A88, // ldr x8, [x20, #0x10]
+    0xBD406100, // ldr s0, [x8, #0x60]
+    0x1F0AA400, // fmsub s0, s0, s10, s9
+    0xBD0002A0, // str s0, [x21]
+    0x1E203900, // fsub s0, s8, s0
+};
+
+constexpr std::size_t kLookScanWindow = 0x420;
+constexpr int kMinimumLookCandidateScore = 4;
 
 // Confirmed GameActivityMotionEvent layout from the supplied binary and v3/v4 logs.
 constexpr std::size_t kEventSourceOffset = 0x04;
@@ -134,17 +138,92 @@ T Symbol(void* library, const char* name) {
     return reinterpret_cast<T>(dlsym(library, name));
 }
 
-void* ResolveLookOffsetTarget(std::byte* base) {
-    for (const auto& candidate : kLookOffsetCandidates) {
-        void* target = base + candidate.rva;
-        if (std::memcmp(target, kLookOffsetSignature, sizeof(kLookOffsetSignature)) == 0) {
-            LOGI("matched LivePlayerRenderer look helper %s at RVA 0x%" PRIxPTR,
-                 candidate.label, candidate.rva);
-            return target;
-        }
-        LOGW("look helper candidate mismatch: %s RVA 0x%" PRIxPTR,
-             candidate.label, candidate.rva);
+bool MatchWords(const std::byte* address, const std::uint32_t* words, std::size_t wordCount) {
+    return std::memcmp(address, words, wordCount * sizeof(std::uint32_t)) == 0;
+}
+
+int ScoreLookOffsetCandidate(const std::byte* address, std::size_t remaining) {
+    if (remaining < sizeof(kLookOffsetSignature) ||
+        !MatchWords(address, kLookOffsetSignature, std::size(kLookOffsetSignature))) {
+        return -1;
     }
+
+    const std::size_t limit = std::min<std::size_t>(remaining, kLookScanWindow);
+    int score = 0;
+    for (std::uint32_t needle : kLookOffsetNeedles) {
+        bool found = false;
+        for (std::size_t offset = 0; offset + sizeof(std::uint32_t) <= limit; offset += sizeof(std::uint32_t)) {
+            std::uint32_t word{};
+            std::memcpy(&word, address + offset, sizeof(word));
+            if (word == needle) {
+                found = true;
+                break;
+            }
+        }
+        if (found) {
+            ++score;
+        }
+    }
+    return score;
+}
+
+struct LookScanContext {
+    std::uintptr_t requestedBase = 0;
+    void* bestTarget = nullptr;
+    std::uintptr_t bestRva = 0;
+    int bestScore = -1;
+    int signatureHits = 0;
+};
+
+int ScanModuleCallback(dl_phdr_info* info, std::size_t, void* rawContext) {
+    auto* context = reinterpret_cast<LookScanContext*>(rawContext);
+    if (!info || info->dlpi_addr == 0 || info->dlpi_addr != context->requestedBase) {
+        return 0;
+    }
+
+    for (int i = 0; i < info->dlpi_phnum; ++i) {
+        const ElfW(Phdr)& phdr = info->dlpi_phdr[i];
+        if (phdr.p_type != PT_LOAD || (phdr.p_flags & PF_X) == 0 || phdr.p_memsz < sizeof(kLookOffsetSignature)) {
+            continue;
+        }
+
+        auto* segment = reinterpret_cast<const std::byte*>(info->dlpi_addr + phdr.p_vaddr);
+        const std::size_t segmentSize = static_cast<std::size_t>(phdr.p_memsz);
+        for (std::size_t offset = 0; offset + sizeof(kLookOffsetSignature) <= segmentSize; offset += sizeof(std::uint32_t)) {
+            const std::byte* candidate = segment + offset;
+            if (!MatchWords(candidate, kLookOffsetSignature, std::size(kLookOffsetSignature))) {
+                continue;
+            }
+
+            ++context->signatureHits;
+            const int score = ScoreLookOffsetCandidate(candidate, segmentSize - offset);
+            const auto rva = static_cast<std::uintptr_t>(candidate - reinterpret_cast<const std::byte*>(info->dlpi_addr));
+            LOGI("look helper signature hit rva=0x%" PRIxPTR " score=%d", rva, score);
+
+            if (score > context->bestScore) {
+                context->bestScore = score;
+                context->bestTarget = const_cast<std::byte*>(candidate);
+                context->bestRva = rva;
+            }
+        }
+    }
+    return 0;
+}
+
+void* ResolveLookOffsetTarget(std::byte* base) {
+    LookScanContext context{};
+    context.requestedBase = reinterpret_cast<std::uintptr_t>(base);
+    dl_iterate_phdr(&ScanModuleCallback, &context);
+
+    if (context.bestTarget && context.bestScore >= kMinimumLookCandidateScore) {
+        LOGI("selected LivePlayerRenderer look helper by pattern scan: rva=0x%" PRIxPTR
+             " score=%d signatureHits=%d",
+             context.bestRva, context.bestScore, context.signatureHits);
+        return context.bestTarget;
+    }
+
+    LOGE("pattern scan failed: signatureHits=%d bestScore=%d; unsupported Minecraft build or changed compiler output",
+         context.signatureHits, context.bestScore);
     return nullptr;
 }
 
@@ -346,8 +425,9 @@ bool InstallHooks() {
         return false;
     }
 
-    LOGI("installed v5.4 / MCBE 26.30 full-screen held-look renderer override; motionTarget=%p lookTarget=%p", motionTarget, lookTarget);
+    LOGI("installed v5.5 pattern-scan full-screen held-look renderer override; motionTarget=%p lookTarget=%p", motionTarget, lookTarget);
     LOGI("input-mode safe design: TOUCH events preserved; no synthetic mouse input is emitted");
+    LOGI("update-resistant mode: LivePlayerRenderer helper is found by executable pattern scan, not hardcoded RVA");
     LOGI("touch follow area: entire screen; gaze hold: persistent after finger release");
     LOGI("axis correction: X inverted; Y restored to v5.1 direction");
     LOGI("test WITHOUT a connected mouse: inventory -> tap/drag anywhere on the screen");
@@ -355,7 +435,7 @@ bool InstallHooks() {
 }
 
 void* InitThread(void*) {
-    LOGI("module loaded: JsonUI inventory touch follow v5.4 for MCBE 26.30 (X-only inversion; full-screen held-look)");
+    LOGI("module loaded: JsonUI inventory touch follow v5.5 (pattern-scan; full-screen held-look)");
     if (ResolvePreloaderApi()) {
         InstallHooks();
     }
