@@ -27,7 +27,8 @@ constexpr std::uint32_t kLookOffsetSignature[] = {
     0xFC1B0FEA, 0x6D00A3E9, 0xA901FBFD, 0xF90017F7
 };
 
-constexpr std::uint32_t kLookOffsetNeedles[] = {
+// Older compiler output (26.23 through 26.31).
+constexpr std::uint32_t kLegacyLookNeedles[] = {
     0xF9400A88, // ldr x8, [x20, #0x10]
     0xBD406100, // ldr s0, [x8, #0x60]
     0x1F0AA400, // fmsub s0, s0, s10, s9
@@ -35,8 +36,19 @@ constexpr std::uint32_t kLookOffsetNeedles[] = {
     0x1E203900, // fsub s0, s8, s0
 };
 
+// NDK r28c / 26.40 compiler output. The scale is now returned by a helper call.
+constexpr std::uint32_t kR28LookNeedles[] = {
+    0xF9400A80, // ldr x0, [x20, #0x10]
+    0x1E200940, // fmul s0, s10, s0
+    0x1E203920, // fsub s0, s9, s0
+    0xBD0002A0, // str s0, [x21]
+    0x1E200920, // fmul s0, s9, s0
+    0x1E203900, // fsub s0, s8, s0
+    0xBD000260, // str s0, [x19]
+};
+
 constexpr std::size_t kLookScanWindow = 0x420;
-constexpr int kMinimumLookCandidateScore = 4;
+constexpr int kMinimumLookCandidateScore = 5;
 
 // Confirmed GameActivityMotionEvent layout from the supplied binary and v3/v4 logs.
 constexpr std::size_t kEventSourceOffset = 0x04;
@@ -77,6 +89,7 @@ using MotionEventFromJavaFn = void (*)(JNIEnv*, jobject, std::byte*);
 // x0=float* outputX, x1=float* outputY, x2/x3/x4 opaque render/UI objects,
 // first two floating arguments arrive in s0/s1 and are used as model-center X/Y.
 using LivePlayerLookOffsetFn = void (*)(float*, float*, void*, void*, void*, float, float);
+using NativeScaleGetterFn = float (*)(void*);
 
 GlossInitFn g_glossInit = nullptr;
 GlossHookFn g_glossHook = nullptr;
@@ -84,6 +97,7 @@ MotionEventFromJavaFn g_oldMotionEventFromJava = nullptr;
 LivePlayerLookOffsetFn g_oldLivePlayerLookOffset = nullptr;
 GHook g_motionHook = nullptr;
 GHook g_lookHook = nullptr;
+NativeScaleGetterFn g_nativeScaleGetter = nullptr;
 
 std::atomic<bool> g_followTouch{false};
 std::atomic<bool> g_haveLastTouch{false};
@@ -117,20 +131,29 @@ float BitsFloat(std::uint32_t bits) {
     return value;
 }
 
-// The original mouse branch at RVA 0x097B8BB8 / 0x097B8C9C reads this
-// render/UI scale and applies it to the signed-short mouse coordinates.
+// 26.40 changed the native scale path from a direct +0x60 load to a helper call.
+// Prefer the dynamically decoded helper when present, then fall back to the legacy layout.
 float ReadNativePointerScale(void* lookContext) {
     if (!lookContext) {
         return 0.0f;
     }
+
     void* scaleState = nullptr;
     std::memcpy(&scaleState, reinterpret_cast<std::byte*>(lookContext) + 0x10, sizeof(scaleState));
     if (!scaleState) {
         return 0.0f;
     }
-    float scale = 0.0f;
-    std::memcpy(&scale, reinterpret_cast<std::byte*>(scaleState) + 0x60, sizeof(scale));
-    return scale;
+
+    if (g_nativeScaleGetter) {
+        const float scale = g_nativeScaleGetter(scaleState);
+        if (scale > 0.0f && scale < 16.0f) {
+            return scale;
+        }
+    }
+
+    float legacyScale = 0.0f;
+    std::memcpy(&legacyScale, reinterpret_cast<std::byte*>(scaleState) + 0x60, sizeof(legacyScale));
+    return legacyScale;
 }
 
 template <typename T>
@@ -142,15 +165,15 @@ bool MatchWords(const std::byte* address, const std::uint32_t* words, std::size_
     return std::memcmp(address, words, wordCount * sizeof(std::uint32_t)) == 0;
 }
 
-int ScoreLookOffsetCandidate(const std::byte* address, std::size_t remaining) {
-    if (remaining < sizeof(kLookOffsetSignature) ||
-        !MatchWords(address, kLookOffsetSignature, std::size(kLookOffsetSignature))) {
-        return -1;
-    }
+int CountNeedles(
+    const std::byte* address,
+    std::size_t limit,
+    const std::uint32_t* needles,
+    std::size_t needleCount) {
 
-    const std::size_t limit = std::min<std::size_t>(remaining, kLookScanWindow);
     int score = 0;
-    for (std::uint32_t needle : kLookOffsetNeedles) {
+    for (std::size_t needleIndex = 0; needleIndex < needleCount; ++needleIndex) {
+        const std::uint32_t needle = needles[needleIndex];
         bool found = false;
         for (std::size_t offset = 0; offset + sizeof(std::uint32_t) <= limit; offset += sizeof(std::uint32_t)) {
             std::uint32_t word{};
@@ -165,6 +188,22 @@ int ScoreLookOffsetCandidate(const std::byte* address, std::size_t remaining) {
         }
     }
     return score;
+}
+
+int ScoreLookOffsetCandidate(const std::byte* address, std::size_t remaining) {
+    if (remaining < sizeof(kLookOffsetSignature) ||
+        !MatchWords(address, kLookOffsetSignature, std::size(kLookOffsetSignature))) {
+        return -1;
+    }
+
+    const std::size_t limit = std::min<std::size_t>(remaining, kLookScanWindow);
+    const int legacyScore = CountNeedles(
+        address, limit, kLegacyLookNeedles, std::size(kLegacyLookNeedles));
+    const int r28Score = CountNeedles(
+        address, limit, kR28LookNeedles, std::size(kR28LookNeedles));
+
+    // Keep profiles separate to avoid unrelated functions accumulating mixed points.
+    return std::max(legacyScore, r28Score);
 }
 
 struct LookScanContext {
@@ -224,6 +263,47 @@ void* ResolveLookOffsetTarget(std::byte* base) {
 
     LOGE("pattern scan failed: signatureHits=%d bestScore=%d; unsupported Minecraft build or changed compiler output",
          context.signatureHits, context.bestScore);
+    return nullptr;
+}
+
+NativeScaleGetterFn ResolveNativeScaleGetter(void* lookTarget) {
+    if (!lookTarget) {
+        return nullptr;
+    }
+
+    auto* code = reinterpret_cast<const std::byte*>(lookTarget);
+    for (std::size_t offset = 0; offset + 12 <= kLookScanWindow; offset += 4) {
+        std::uint32_t first{};
+        std::uint32_t branch{};
+        std::uint32_t third{};
+        std::memcpy(&first, code + offset, 4);
+        std::memcpy(&branch, code + offset + 4, 4);
+        std::memcpy(&third, code + offset + 8, 4);
+
+        // 26.40 path:
+        // ldr x0, [x20, #0x10]
+        // bl  <native UI scale getter>
+        // fmul s0, s10/s9, s0
+        const bool isScaleLoad = first == 0xF9400A80;
+        const bool isBl = (branch & 0xFC000000u) == 0x94000000u;
+        const bool isExpectedFmul = third == 0x1E200940 || third == 0x1E200920;
+        if (!isScaleLoad || !isBl || !isExpectedFmul) {
+            continue;
+        }
+
+        std::int32_t imm26 = static_cast<std::int32_t>(branch & 0x03FFFFFFu);
+        if ((imm26 & 0x02000000) != 0) {
+            imm26 |= static_cast<std::int32_t>(0xFC000000u);
+        }
+        const std::intptr_t displacement = static_cast<std::intptr_t>(imm26) << 2;
+        const auto* branchAddress = code + offset + 4;
+        auto* target = const_cast<std::byte*>(branchAddress + displacement);
+        LOGI("decoded native pointer-scale getter from look helper: offset=0x%zx target=%p",
+             offset + 4, target);
+        return reinterpret_cast<NativeScaleGetterFn>(target);
+    }
+
+    LOGI("native pointer-scale getter call not present; using legacy +0x60 layout");
     return nullptr;
 }
 
@@ -407,6 +487,8 @@ bool InstallHooks() {
         return false;
     }
 
+    g_nativeScaleGetter = ResolveNativeScaleGetter(lookTarget);
+
     g_lookHook = g_glossHook(
         lookTarget,
         reinterpret_cast<void*>(&HookLivePlayerLookOffset),
@@ -425,7 +507,7 @@ bool InstallHooks() {
         return false;
     }
 
-    LOGI("installed v5.5 pattern-scan full-screen held-look renderer override; motionTarget=%p lookTarget=%p", motionTarget, lookTarget);
+    LOGI("installed v5.6 / MCBE 26.40 multi-profile pattern-scan renderer override; motionTarget=%p lookTarget=%p", motionTarget, lookTarget);
     LOGI("input-mode safe design: TOUCH events preserved; no synthetic mouse input is emitted");
     LOGI("update-resistant mode: LivePlayerRenderer helper is found by executable pattern scan, not hardcoded RVA");
     LOGI("touch follow area: entire screen; gaze hold: persistent after finger release");
@@ -435,7 +517,7 @@ bool InstallHooks() {
 }
 
 void* InitThread(void*) {
-    LOGI("module loaded: JsonUI inventory touch follow v5.5 (pattern-scan; full-screen held-look)");
+    LOGI("module loaded: JsonUI inventory touch follow v5.6 for MCBE 26.40 (multi-profile pattern-scan)");
     if (ResolvePreloaderApi()) {
         InstallHooks();
     }
