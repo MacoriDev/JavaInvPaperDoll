@@ -30,6 +30,8 @@ jobs:
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools'
 
       - name: Install Android NDK r27c and Ninja
         shell: bash
@@ -77,7 +79,7 @@ jobs:
 
           TAG="continuous-${GITHUB_REF_NAME}"
           TITLE="${MODULE_NAME} continuous (${GITHUB_REF_NAME})"
-          NOTES="Automatic ARM64 test build from commit ${GITHUB_SHA}. This is a JsonUI GameActivity input probe build; it logs mouse and touch motion events without changing Minecraft rendering or input."
+          NOTES="Automatic ARM64 test build from commit ${GITHUB_SHA}. Inventory touch-follow renderer build for ARM64; includes a 26.60 compatibility profile and existing legacy profiles."
 
           retry() {
             local tries=0
