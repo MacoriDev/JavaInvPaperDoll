@@ -47,6 +47,20 @@ constexpr std::uint32_t kR28LookNeedles[] = {
     0xBD000260, // str s0, [x19]
 };
 
+// 26.60 keeps the same function ABI, but uses x21 for the UI scale state
+// and x20 for the horizontal output. All instructions are required so the
+// pre-existing five-point profile cannot select a partial match by accident.
+constexpr std::uint32_t k2660LookNeedles[] = {
+    0xF9400AB5, // ldr x21, [x21, #0x10]
+    0xAA1503E0, // mov x0, x21
+    0x1E200940, // fmul s0, s10, s0
+    0x1E203920, // fsub s0, s9, s0
+    0xBD000280, // str s0, [x20]
+    0x1E200920, // fmul s0, s9, s0
+    0x1E203900, // fsub s0, s8, s0
+    0xBD000260, // str s0, [x19]
+};
+
 constexpr std::size_t kLookScanWindow = 0x420;
 constexpr int kMinimumLookCandidateScore = 5;
 
@@ -202,8 +216,13 @@ int ScoreLookOffsetCandidate(const std::byte* address, std::size_t remaining) {
     const int r28Score = CountNeedles(
         address, limit, kR28LookNeedles, std::size(kR28LookNeedles));
 
-    // Keep profiles separate to avoid unrelated functions accumulating mixed points.
-    return std::max(legacyScore, r28Score);
+    const int score2660 = CountNeedles(
+        address, limit, k2660LookNeedles, std::size(k2660LookNeedles));
+
+    // Only accept the new profile as a whole; preserve the existing profiles.
+    const int complete2660 = score2660 == static_cast<int>(std::size(k2660LookNeedles))
+        ? score2660 : -1;
+    return std::max({legacyScore, r28Score, complete2660});
 }
 
 struct LookScanContext {
@@ -212,6 +231,7 @@ struct LookScanContext {
     std::uintptr_t bestRva = 0;
     int bestScore = -1;
     int signatureHits = 0;
+    bool ambiguousBest = false;
 };
 
 int ScanModuleCallback(dl_phdr_info* info, std::size_t, void* rawContext) {
@@ -243,6 +263,9 @@ int ScanModuleCallback(dl_phdr_info* info, std::size_t, void* rawContext) {
                 context->bestScore = score;
                 context->bestTarget = const_cast<std::byte*>(candidate);
                 context->bestRva = rva;
+                context->ambiguousBest = false;
+            } else if (score == context->bestScore && score >= kMinimumLookCandidateScore) {
+                context->ambiguousBest = true;
             }
         }
     }
@@ -254,15 +277,15 @@ void* ResolveLookOffsetTarget(std::byte* base) {
     context.requestedBase = reinterpret_cast<std::uintptr_t>(base);
     dl_iterate_phdr(&ScanModuleCallback, &context);
 
-    if (context.bestTarget && context.bestScore >= kMinimumLookCandidateScore) {
+    if (context.bestTarget && context.bestScore >= kMinimumLookCandidateScore && !context.ambiguousBest) {
         LOGI("selected LivePlayerRenderer look helper by pattern scan: rva=0x%" PRIxPTR
              " score=%d signatureHits=%d",
              context.bestRva, context.bestScore, context.signatureHits);
         return context.bestTarget;
     }
 
-    LOGE("pattern scan failed: signatureHits=%d bestScore=%d; unsupported Minecraft build or changed compiler output",
-         context.signatureHits, context.bestScore);
+    LOGE("pattern scan failed or ambiguous: signatureHits=%d bestScore=%d ambiguous=%d",
+         context.signatureHits, context.bestScore, context.ambiguousBest);
     return nullptr;
 }
 
@@ -284,7 +307,14 @@ NativeScaleGetterFn ResolveNativeScaleGetter(void* lookTarget) {
         // ldr x0, [x20, #0x10]
         // bl  <native UI scale getter>
         // fmul s0, s10/s9, s0
-        const bool isScaleLoad = first == 0xF9400A80;
+        // 26.60 loads x21 from [x21, #0x10] once, then moves it into
+        // x0 before each scale call. Require the preceding load too.
+        std::uint32_t previous{};
+        if (offset >= 4) {
+            std::memcpy(&previous, code + offset - 4, 4);
+        }
+        const bool isScaleLoad = first == 0xF9400A80 ||
+            (previous == 0xF9400AB5 && first == 0xAA1503E0);
         const bool isBl = (branch & 0xFC000000u) == 0x94000000u;
         const bool isExpectedFmul = third == 0x1E200940 || third == 0x1E200920;
         if (!isScaleLoad || !isBl || !isExpectedFmul) {
@@ -295,7 +325,7 @@ NativeScaleGetterFn ResolveNativeScaleGetter(void* lookTarget) {
         if ((imm26 & 0x02000000) != 0) {
             imm26 |= static_cast<std::int32_t>(0xFC000000u);
         }
-        const std::intptr_t displacement = static_cast<std::intptr_t>(imm26) << 2;
+        const std::intptr_t displacement = static_cast<std::intptr_t>(imm26) * 4;
         const auto* branchAddress = code + offset + 4;
         auto* target = const_cast<std::byte*>(branchAddress + displacement);
         LOGI("decoded native pointer-scale getter from look helper: offset=0x%zx target=%p",
@@ -507,7 +537,7 @@ bool InstallHooks() {
         return false;
     }
 
-    LOGI("installed v5.6 / MCBE 26.40 multi-profile pattern-scan renderer override; motionTarget=%p lookTarget=%p", motionTarget, lookTarget);
+    LOGI("installed v5.7 / MCBE 26.60 and legacy multi-profile pattern-scan renderer override; motionTarget=%p lookTarget=%p", motionTarget, lookTarget);
     LOGI("input-mode safe design: TOUCH events preserved; no synthetic mouse input is emitted");
     LOGI("update-resistant mode: LivePlayerRenderer helper is found by executable pattern scan, not hardcoded RVA");
     LOGI("touch follow area: entire screen; gaze hold: persistent after finger release");
@@ -517,7 +547,7 @@ bool InstallHooks() {
 }
 
 void* InitThread(void*) {
-    LOGI("module loaded: JsonUI inventory touch follow v5.6 for MCBE 26.40 (multi-profile pattern-scan)");
+    LOGI("module loaded: JsonUI inventory touch follow v5.7 for MCBE 26.60 and legacy builds (multi-profile pattern-scan)");
     if (ResolvePreloaderApi()) {
         InstallHooks();
     }
